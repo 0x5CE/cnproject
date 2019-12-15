@@ -37,11 +37,11 @@ typedef struct sockaddr SA;
 
 #define SEGMENT_SIZE(s) (sizeof(s) - SEGMENT_MESSAGE_SIZE + s.length)
 #define SEGMENT_MESSAGE_SIZE 10 
-int networkWindowSize = 5;
+int networkWindowSize = 10;
 
 typedef struct Segment
 {
-		uint16_t checksum;
+		int checksum;
 		int length;
 		int seqnum;
 		char message[SEGMENT_MESSAGE_SIZE];
@@ -56,10 +56,6 @@ uint16_t checksum(Segment seg)
 {
     uint16_t *segBytes = (uint16_t*) &seg;
     int n = seg.length;
-	
-	if (n <= sizeof(seg.checksum))
-		return 0;
-
     uint16_t csum = 0xffff; 
 
     for (int i=sizeof(seg.checksum); i < n/2; i++)
@@ -83,14 +79,12 @@ int fileSender(unsigned short port, char* fileName)
 	printf("File sender started with:\n\tfileName: \t%s\n\
 		\tport: \t\t%d\n", fileName, port);
 
-	Segment *segWin = (Segment*) malloc(sizeof(Segment) * networkWindowSize);
 	//sender (server), receiver (client) details (IP, ports, etc.)
 	SAin servaddr, cliaddr;
+	__bzero(&servaddr, sizeof(servaddr));
+	__bzero(&cliaddr, sizeof(cliaddr));
 
-	memset(&servaddr, 0, sizeof(servaddr));
-	memset(&cliaddr, 0, sizeof(cliaddr));
-
-	Segment segRecv;
+	Segment seg, segRecv;
 
 	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0)
@@ -112,8 +106,6 @@ int fileSender(unsigned short port, char* fileName)
 	n = recvfrom(sockfd, (Segment *)&segRecv, sizeof(segRecv), MSG_WAITALL,
 		(SA*) &cliaddr, &len);
 
-	len = sizeof(servaddr);
-
 	printf("Client: %d %d %d %s\n", segRecv.checksum, 
 		segRecv.length, segRecv.seqnum, segRecv.message);
 
@@ -121,36 +113,29 @@ int fileSender(unsigned short port, char* fileName)
 	if (!sendFP)
 		return ERROR_FILE_FOPEN;
 
-	int pktCount = 0;
-	segWin[pktCount].seqnum = 0;
-
-	while ((byteRead = fread(segWin[pktCount].message, sizeof(char),
+	seg.seqnum = 0;
+	int sendCount = 0;
+	while ((byteRead = fread(seg.message, sizeof(char),
 		 SEGMENT_MESSAGE_SIZE, sendFP)))
 	{
-		segWin[pktCount].length = byteRead;
-		segWin[pktCount].seqnum = (segWin[pktCount].seqnum + 1);
-		segWin[pktCount].checksum = checksum(segWin[pktCount]);
+		seg.length = byteRead;
+		seg.checksum = 0;
+		seg.seqnum = seg.seqnum + 1;
+		seg.checksum = checksum(seg);
 
-		n = sendto(sockfd, (Segment *) &segWin[pktCount], sizeof(segWin[pktCount]), MSG_CONFIRM,
-			(cSA*) &cliaddr, len);
-
-		//wait for ack
-		if (pktCount == networkWindowSize-1)
+		//ack from sender
+		if (sendCount == networkWindowSize)
 		{
 			n = recvfrom(sockfd, (Segment *)&segRecv, sizeof(segRecv), MSG_WAITALL,
-		(SA*) &cliaddr, &len);
-
-			printf("RECEIVING ACK.........%d\n", pktCount);
-			pktCount = -1;
+				(SA*) &cliaddr, &len);
+			printf("ack recieved %d\n", segRecv.seqnum);
 		}
-		pktCount++;
+		n = sendto(sockfd, (Segment *) &seg, SEGMENT_SIZE(seg), MSG_CONFIRM,
+			(cSA*) &cliaddr, len);
+		sendCount++;
 	}
-
-	//eof
-	segWin[0].length = 0;
-	segWin[0].checksum = checksum(segWin[0]);
-	n = sendto(sockfd, (Segment *) &segWin[0], sizeof(segWin[0]), MSG_CONFIRM,
-			(cSA*) &cliaddr, len); 
+	n = sendto(sockfd, (Segment *) &seg, 0, MSG_CONFIRM,
+			(cSA*) &cliaddr, len); //eof
 
 	fclose(sendFP);
 	close(sockfd);
@@ -163,12 +148,11 @@ int fileRecveiver(unsigned short port, char* fileName)
 		\tport: \t\t%d\n", fileName, port);
 
 	SAin servaddr;
-	memset(&servaddr, 0, sizeof(servaddr));
+	__bzero(&servaddr, sizeof(servaddr));
 
-	Segment *segWin = (Segment*) malloc(sizeof(Segment) * networkWindowSize);
-	Segment seg;
+	Segment seg, segRecv;
 	seg.seqnum = 0;
-	seg.length = -1;
+	seg.length = -1;	//indicates ack/nack
 
 	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0)
@@ -191,62 +175,43 @@ int fileRecveiver(unsigned short port, char* fileName)
 		return ERROR_FILE_FOPEN;
 	}
 
-	len = sizeof(servaddr);
-	int pktCount = 0;
-
-	while ((n = recvfrom(sockfd, (Segment *)&segWin[pktCount], sizeof(segWin[pktCount]),
+	int recvCount = 0;
+	while ((n = recvfrom(sockfd, (Segment *)&segRecv, sizeof(segRecv),
 		MSG_WAITALL, (SA*) &servaddr, &len)))
 	{
-		int isEOF = (segWin[pktCount].length == 0);
-
-		//for (int i=0; i<1000000; i++) {int j = i*i*3;}
-		if (segWin[pktCount].checksum != checksum(segWin[pktCount]))
+		bytesWritten = fwrite(segRecv.message, sizeof(char),
+			segRecv.length, recvFP);
+		if (bytesWritten != segRecv.length)
 		{
-			segWin[pktCount].length = -1;	//mark error
-			printf("ERROR IN CHECKSUM! %x %x\n",
-				segWin[pktCount].checksum, checksum(segWin[pktCount]));
+			fclose(recvFP);
+			close(sockfd);
+			return ERROR_FILE_WRITE;
 		}
 
-		//send ack
-		if (pktCount == networkWindowSize - 1
-		 || isEOF)
+		//commulative ack
+		if (recvCount == networkWindowSize)
 		{
-			//buffer --> disk
-			for (int i=0; i<=pktCount; i++)
-			{
-				if (segWin[i].length < 1) break;	
-
-				bytesWritten = fwrite(segWin[i].message,
-					sizeof(char), segWin[i].length, recvFP);
-				if (bytesWritten != segWin[i].length)
-				{
-					fclose(recvFP);
-					close(sockfd);
-					return ERROR_FILE_WRITE;
-				}
-			}
-
-			seg.seqnum += pktCount;
+			seg.checksum += recvCount;
 			sendto(sockfd, (Segment *)&seg, sizeof(seg), MSG_CONFIRM,
 				(cSA*) &servaddr, sizeof(servaddr));
-			printf("SENDING ACK.........%d\n", pktCount);
-			pktCount = -1;
+			printf("ack sent %d\n", seg.seqnum);
+			recvCount = 0;
 		}
-			
-		if (isEOF)
+
+		segRecv.message[segRecv.length] = '\0';
+		printf("Client: %d %d %d %s\n", segRecv.checksum, 
+			segRecv.length, segRecv.seqnum, segRecv.message);
+		if (segRecv.checksum == checksum(segRecv))
 		{
-			printf("EOF reached.........Packets transmitted: %d\n", seg.seqnum);
-			break;	
+			printf("Checksum Ok.\n");
 		}
-
-		pktCount++;
-		len = sizeof(servaddr);
-
-		//segWin[pktCount].message[segWin[pktCount].length] = '\0';
-		//printf("Client: %d %d %d %s\n", segWin[pktCount].checksum, 
-		//segWin[pktCount].length, segWin[pktCount].seqnum, segWin[pktCount].message);
+		else
+		{
+			printf("ERROR IN CHECKSUM! %x %x\n", segRecv.checksum, checksum(segRecv));
+		}
+		recvCount++;
 	}
-		
+
 	fclose(recvFP);
 	close(sockfd);
 	return 0;
