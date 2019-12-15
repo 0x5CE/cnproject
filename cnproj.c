@@ -40,8 +40,8 @@ typedef struct sockaddr SA;
 //#define SIM_CORRUPTION_CHECKSUM 14 //chance of error: use 0 to 14
 
 #define SEGMENT_SIZE(s) (sizeof(s) - SEGMENT_MESSAGE_SIZE + s.length)
-#define SEGMENT_MESSAGE_SIZE 1
-int networkWindowSize = 5;
+#define SEGMENT_MESSAGE_SIZE 400
+int networkWindowSize = 10;
 
 typedef struct Segment
 {
