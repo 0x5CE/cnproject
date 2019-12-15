@@ -4,7 +4,7 @@
 //Usage: 	./cnproj Sender/Recveiver filename listenport
 //
 //Authors:	Syed Muazzam Ali Shah Kazmi
-//		Muhammad Hasnain Naeem
+//			Muhammad Hasnain Naeem
 //
 //NOTE: this file contains code for both the sender and the receiver 
 
@@ -51,6 +51,73 @@ int main(int argc, char *argv[]);
 int fileSender(unsigned short port, char* fileName);
 int fileRecveiver(unsigned short port, char* fileName);
 uint16_t checksum(Segment seg);
+int checkWindow(Segment *segWin, int winSize, int nextSeq, int *defectivePackets);
+int saveWindow(Segment *segWin, int winSize, FILE *recvFP);
+void getSegmentOrder(Segment *segWin, int winSize, int *orderArray);
+
+//reorders and saves
+int saveWindow(Segment *segWin, int winSize, FILE *recvFP)
+{
+		if (winSize < 1)
+			return NO_ERRORS;
+
+		int *orderArray = (int*)malloc(winSize * sizeof(int));
+		getSegmentOrder(segWin, winSize, orderArray);
+
+		int bytesWritten = 0;
+		for (int i=0; i<winSize; i++)
+		{
+			int ordIndex = orderArray[i];	//save in that order			
+			if (segWin[ordIndex].length < 1) break;	
+
+			bytesWritten = fwrite(segWin[ordIndex].message,
+				sizeof(char), segWin[ordIndex].length, recvFP);
+			if (bytesWritten != segWin[ordIndex].length)
+			{
+				fclose(recvFP);
+				return ERROR_FILE_WRITE;
+			}
+
+		}
+		return NO_ERRORS;
+}
+
+//supporting function for saveWindow()
+//gives packet orders in descending seqnum order
+void getSegmentOrder(Segment *segWin, int winSize, int *orderArray)
+{
+	if (winSize < 1)
+		return;
+
+	int orderArrayN = winSize-1;
+	for (int i=0; i<winSize; i++)
+	{
+		int largestSeq = 0;
+		int largestIndex = 0;
+		for (int j=0; j<winSize; j++)
+		{
+			if ((segWin[j].seqnum > largestSeq) && (segWin[j].seqnum > 0))
+			{
+				largestSeq = segWin[j].seqnum;
+				largestIndex = j;
+			}
+		}
+		segWin[largestIndex].seqnum = -1;
+		orderArray[orderArrayN--] = largestIndex;
+	}
+}
+
+//performs checksum, checks possible duplicates, and stores defective packets in defectivePackets array
+int checkWindow(Segment *segWin, int winSize, int nextSeq, int *defectivePackets)
+{
+	int numDefect = 0;
+    for (int i=0; i<winSize; i++)
+    {
+		if (segWin[0].checksum != checksum(segWin[0]))
+			defectivePackets[numDefect] = i;
+    }
+    return numDefect;
+}
 
 uint16_t checksum(Segment seg)
 {
@@ -83,14 +150,14 @@ int fileSender(unsigned short port, char* fileName)
 	printf("File sender started with:\n\tfileName: \t%s\n\
 		\tport: \t\t%d\n", fileName, port);
 
-	Segment *segWin = (Segment*) malloc(sizeof(Segment) * networkWindowSize);
 	//sender (server), receiver (client) details (IP, ports, etc.)
 	SAin servaddr, cliaddr;
 
+	Segment *segWin = (Segment*) malloc(sizeof(Segment) * networkWindowSize);
+	Segment segRecv;
+
 	memset(&servaddr, 0, sizeof(servaddr));
 	memset(&cliaddr, 0, sizeof(cliaddr));
-
-	Segment segRecv;
 
 	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0)
@@ -111,34 +178,42 @@ int fileSender(unsigned short port, char* fileName)
 
 	n = recvfrom(sockfd, (Segment *)&segRecv, sizeof(segRecv), MSG_WAITALL,
 		(SA*) &cliaddr, &len);
-
-	len = sizeof(servaddr);
-
-	printf("Client: %d %d %d %s\n", segRecv.checksum, 
-		segRecv.length, segRecv.seqnum, segRecv.message);
+	printf("Connection established\n");
 
 	FILE *sendFP = fopen(fileName, "r");
 	if (!sendFP)
 		return ERROR_FILE_FOPEN;
 
-	int pktCount = 0;
+	int pktCount = 0, glbSeqnum = 0;
 	segWin[pktCount].seqnum = 0;
+	len = sizeof(cliaddr);
 
 	while ((byteRead = fread(segWin[pktCount].message, sizeof(char),
 		 SEGMENT_MESSAGE_SIZE, sendFP)))
 	{
 		segWin[pktCount].length = byteRead;
-		segWin[pktCount].seqnum = (segWin[pktCount].seqnum + 1);
+		segWin[pktCount].seqnum = glbSeqnum++;
 		segWin[pktCount].checksum = checksum(segWin[pktCount]);
 
-		n = sendto(sockfd, (Segment *) &segWin[pktCount], sizeof(segWin[pktCount]), MSG_CONFIRM,
-			(cSA*) &cliaddr, len);
+		n = sendto(sockfd, (Segment *) &segWin[pktCount],
+			sizeof(segWin[pktCount]), MSG_CONFIRM, (cSA*) &cliaddr, len);
 
 		//wait for ack
 		if (pktCount == networkWindowSize-1)
 		{
-			n = recvfrom(sockfd, (Segment *)&segRecv, sizeof(segRecv), MSG_WAITALL,
-		(SA*) &cliaddr, &len);
+			do
+			{
+				n = recvfrom(sockfd, (Segment *)&segRecv, sizeof(segRecv),
+				 MSG_WAITALL, (SA*) &cliaddr, &len);
+
+				if (segRecv.seqnum >= 0 && segRecv.seqnum < networkWindowSize)
+				{
+					//resend requested packet
+					n = sendto(sockfd, (Segment *) &segWin[segRecv.seqnum],
+						sizeof(segWin[segRecv.seqnum]), MSG_CONFIRM, (cSA*) &cliaddr, len);
+				}
+			}
+			while (segRecv.seqnum != -1);	//-1 ack = Ok to proceed
 
 			printf("RECEIVING ACK.........%d\n", pktCount);
 			pktCount = -1;
@@ -148,6 +223,7 @@ int fileSender(unsigned short port, char* fileName)
 
 	//eof
 	segWin[0].length = 0;
+	segWin[0].seqnum = glbSeqnum;
 	segWin[0].checksum = checksum(segWin[0]);
 	n = sendto(sockfd, (Segment *) &segWin[0], sizeof(segWin[0]), MSG_CONFIRM,
 			(cSA*) &cliaddr, len); 
@@ -182,7 +258,7 @@ int fileRecveiver(unsigned short port, char* fileName)
 
 	sendto(sockfd, (Segment *)&seg, sizeof(seg), MSG_CONFIRM,
 		(cSA*) &servaddr, sizeof(servaddr));
-	printf("Hello message sent.\n");
+	printf("Handshake message sent.\n");
 
 	FILE *recvFP = fopen(fileName, "w");
 	if (!recvFP)
@@ -192,50 +268,56 @@ int fileRecveiver(unsigned short port, char* fileName)
 	}
 
 	len = sizeof(servaddr);
-	int pktCount = 0;
+	int pktCount = 0, glbSeqnum = 0;
+	int *defectivePackets = (int*)malloc(sizeof(int)*networkWindowSize);
 
-	while ((n = recvfrom(sockfd, (Segment *)&segWin[pktCount], sizeof(segWin[pktCount]),
-		MSG_WAITALL, (SA*) &servaddr, &len)))
+	while ((n = recvfrom(sockfd, (Segment *)&segWin[pktCount],
+		sizeof(segWin[pktCount]), MSG_WAITALL, (SA*) &servaddr, &len)))
 	{
 		int isEOF = (segWin[pktCount].length == 0);
 
 		//for (int i=0; i<1000000; i++) {int j = i*i*3;}
-		if (segWin[pktCount].checksum != checksum(segWin[pktCount]))
-		{
-			segWin[pktCount].length = -1;	//mark error
-			printf("ERROR IN CHECKSUM! %x %x\n",
-				segWin[pktCount].checksum, checksum(segWin[pktCount]));
-		}
 
 		//send ack
 		if (pktCount == networkWindowSize - 1
 		 || isEOF)
 		{
-			//buffer --> disk
-			for (int i=0; i<=pktCount; i++)
+			int nDef = 0;
+			while (( nDef = checkWindow(segWin, pktCount+1, seg.seqnum, defectivePackets)))
 			{
-				if (segWin[i].length < 1) break;	
-
-				bytesWritten = fwrite(segWin[i].message,
-					sizeof(char), segWin[i].length, recvFP);
-				if (bytesWritten != segWin[i].length)
+				//get correct packets for corrupted/duplicate packets
+				for (int i=0; i<nDef; i++)
 				{
-					fclose(recvFP);
-					close(sockfd);
-					return ERROR_FILE_WRITE;
+						seg.seqnum += defectivePackets[i];
+						sendto(sockfd, (Segment *)&seg, sizeof(seg), MSG_CONFIRM,
+							(cSA*) &servaddr, sizeof(servaddr));
+
+						printf("Recovering packet: %d\n", seg.seqnum);
+
+						n = recvfrom(sockfd, (Segment *)&segWin[defectivePackets[i]],
+							sizeof(Segment), MSG_WAITALL, (SA*) &servaddr, &len);
+						glbSeqnum++;
 				}
 			}
 
-			seg.seqnum += pktCount;
+			//all okay, now save
+			if (saveWindow(segWin, pktCount+1, recvFP) != NO_ERRORS)
+			{
+				close(sockfd);
+				return ERROR_FILE_WRITE;
+			}
+
+			seg.seqnum = -1;	//all ok, proceed
 			sendto(sockfd, (Segment *)&seg, sizeof(seg), MSG_CONFIRM,
 				(cSA*) &servaddr, sizeof(servaddr));
 			printf("SENDING ACK.........%d\n", pktCount);
 			pktCount = -1;
+			glbSeqnum++;
 		}
 			
 		if (isEOF)
 		{
-			printf("EOF reached.........Packets transmitted: %d\n", seg.seqnum);
+			printf("EOF reached.........Packets transmitted: %d\n", glbSeqnum);
 			break;	
 		}
 
