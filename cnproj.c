@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 enum allErrors
 {
@@ -35,8 +36,11 @@ typedef struct sockaddr_in SAin;
 typedef const struct sockaddr cSA;
 typedef struct sockaddr SA;
 
+//#define SIM_LATENCY 1000		//latency in milliseconds
+//#define SIM_CORRUPTION_CHECKSUM 14 //chance of error: use 0 to 14
+
 #define SEGMENT_SIZE(s) (sizeof(s) - SEGMENT_MESSAGE_SIZE + s.length)
-#define SEGMENT_MESSAGE_SIZE 10 
+#define SEGMENT_MESSAGE_SIZE 1
 int networkWindowSize = 5;
 
 typedef struct Segment
@@ -113,8 +117,8 @@ int checkWindow(Segment *segWin, int winSize, int nextSeq, int *defectivePackets
 	int numDefect = 0;
     for (int i=0; i<winSize; i++)
     {
-		if (segWin[0].checksum != checksum(segWin[0]))
-			defectivePackets[numDefect] = i;
+		if (segWin[i].checksum != checksum(segWin[i]))
+			defectivePackets[numDefect++] = i;
     }
     return numDefect;
 }
@@ -193,6 +197,7 @@ int fileSender(unsigned short port, char* fileName)
 	{
 		segWin[pktCount].length = byteRead;
 		segWin[pktCount].seqnum = glbSeqnum++;
+
 		segWin[pktCount].checksum = checksum(segWin[pktCount]);
 
 		n = sendto(sockfd, (Segment *) &segWin[pktCount],
@@ -211,6 +216,8 @@ int fileSender(unsigned short port, char* fileName)
 					//resend requested packet
 					n = sendto(sockfd, (Segment *) &segWin[segRecv.seqnum],
 						sizeof(segWin[segRecv.seqnum]), MSG_CONFIRM, (cSA*) &cliaddr, len);
+
+					printf("Selective repeat requested.\n");
 				}
 			}
 			while (segRecv.seqnum != -1);	//-1 ack = Ok to proceed
@@ -276,19 +283,25 @@ int fileRecveiver(unsigned short port, char* fileName)
 	{
 		int isEOF = (segWin[pktCount].length == 0);
 
-		//for (int i=0; i<1000000; i++) {int j = i*i*3;}
-
+//Simulate latency
+#ifdef SIM_LATENCY
+		usleep(1000);
+#endif
+//Simulate corrupted papcket (with checksum)
+#ifdef SIM_CORRUPTION_CHECKSUM
+		if (rand() % 100 < SIM_CORRUPTION_CHECKSUM) segWin[pktCount].checksum = 1234;
+#endif
 		//send ack
 		if (pktCount == networkWindowSize - 1
 		 || isEOF)
 		{
 			int nDef = 0;
-			while (( nDef = checkWindow(segWin, pktCount+1, seg.seqnum, defectivePackets)))
+			while ( ( nDef = checkWindow(segWin, pktCount+1, seg.seqnum, defectivePackets)))
 			{
 				//get correct packets for corrupted/duplicate packets
 				for (int i=0; i<nDef; i++)
 				{
-						seg.seqnum += defectivePackets[i];
+						seg.seqnum = defectivePackets[i];
 						sendto(sockfd, (Segment *)&seg, sizeof(seg), MSG_CONFIRM,
 							(cSA*) &servaddr, sizeof(servaddr));
 
@@ -312,9 +325,8 @@ int fileRecveiver(unsigned short port, char* fileName)
 				(cSA*) &servaddr, sizeof(servaddr));
 			printf("SENDING ACK.........%d\n", pktCount);
 			pktCount = -1;
-			glbSeqnum++;
 		}
-			
+		
 		if (isEOF)
 		{
 			printf("EOF reached.........Packets transmitted: %d\n", glbSeqnum);
@@ -322,6 +334,7 @@ int fileRecveiver(unsigned short port, char* fileName)
 		}
 
 		pktCount++;
+		glbSeqnum++;
 		len = sizeof(servaddr);
 
 		//segWin[pktCount].message[segWin[pktCount].length] = '\0';
@@ -336,6 +349,7 @@ int fileRecveiver(unsigned short port, char* fileName)
 
 int main(int argc, char *argv[])
 {
+	srand(time(0));
 	int status = ERROR_NOT_ENOUGH_ARGS; 
 	do
 	{

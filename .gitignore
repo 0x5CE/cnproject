@@ -1,3 +1,4 @@
 cnproj
 *.txt
 *~
+.idea/
